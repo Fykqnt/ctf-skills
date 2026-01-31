@@ -6,15 +6,19 @@ Focus:
 - Quick file carving helpers
 - Hashing / entropy / strings
 - Magic header detection
-- Simple PCAP keyword grep (raw) (not full protocol analysis)
+- PCAP quick analysis (for deep analysis, use network_analyzer.py)
 
-Stdlib only. Combine with external tools when needed.
+Stdlib only for core functions. Combine with external tools when needed.
+
+For full PCAP/network analysis with pyshark/tshark/scapy:
+  → Use network_analyzer.py instead
 
 Examples:
   python3 forensics_utils.py identify suspicious.bin
   python3 forensics_utils.py strings suspicious.bin --min 6 | head
   python3 forensics_utils.py entropy suspicious.bin
   python3 forensics_utils.py carve-png disk.img --out ./out
+  python3 forensics_utils.py pcap-quick capture.pcap --pattern "flag"
 """
 from __future__ import annotations
 
@@ -39,6 +43,22 @@ MAGIC = [
     (b"SQLite format 3\x00", "SQLite"),
     (b"OggS", "OGG"),
     (b"RIFF", "RIFF/WAV/AVI"),
+    # PCAP formats
+    (b"\xd4\xc3\xb2\xa1", "PCAP (little-endian)"),
+    (b"\xa1\xb2\xc3\xd4", "PCAP (big-endian)"),
+    (b"\x0a\x0d\x0d\x0a", "PCAPNG"),
+    # Archives
+    (b"\x1f\x8b", "GZIP"),
+    (b"BZ", "BZIP2"),
+    (b"\xfd7zXZ\x00", "XZ"),
+    (b"7z\xbc\xaf\x27\x1c", "7Z"),
+    (b"Rar!\x1a\x07", "RAR"),
+    # Executables
+    (b"MZ", "PE/DOS"),
+    (b"\xca\xfe\xba\xbe", "Mach-O (fat)"),
+    (b"\xfe\xed\xfa\xce", "Mach-O 32"),
+    (b"\xfe\xed\xfa\xcf", "Mach-O 64"),
+    (b"\xcf\xfa\xed\xfe", "Mach-O 64 (le)"),
 ]
 
 
@@ -170,6 +190,63 @@ def cmd_carve_png(args: argparse.Namespace) -> None:
         outpath.write_bytes(b)
         print(f"wrote {outpath} ({len(b)} bytes)")
 
+
+def cmd_pcap_quick(args: argparse.Namespace) -> None:
+    """
+    Quick PCAP triage: identify, basic stats, pattern search.
+    For deep analysis, use network_analyzer.py instead.
+    """
+    p = Path(args.path)
+    data = p.read_bytes()
+
+    # Identify PCAP type
+    hits = identify(data[:64])
+    pcap_type = None
+    for h in hits:
+        if "PCAP" in h:
+            pcap_type = h
+            break
+
+    if not pcap_type:
+        print(f"[!] File does not appear to be a PCAP: {hits}")
+        print("[!] For full analysis, use: python3 network_analyzer.py stats <file>")
+        return
+
+    print(f"[+] File: {p.name}")
+    print(f"[+] Type: {pcap_type}")
+    print(f"[+] Size: {p.stat().st_size} bytes")
+    print(f"[+] SHA256: {sha256_file(p)}")
+
+    # Pattern search in raw bytes
+    if args.pattern:
+        needle = args.pattern.encode()
+        idx = 0
+        hits_count = 0
+        print(f"\n[*] Searching for '{args.pattern}'...")
+        while True:
+            j = data.find(needle, idx)
+            if j == -1:
+                break
+            context_start = max(0, j - 20)
+            context_end = min(len(data), j + len(needle) + 40)
+            snippet = data[context_start:context_end]
+            try:
+                snippet_str = snippet.decode("utf-8", "ignore")
+            except:
+                snippet_str = binascii.hexlify(snippet[:40]).decode()
+            print(f"  @{j}: ...{snippet_str}...")
+            hits_count += 1
+            idx = j + 1
+            if hits_count >= 10:
+                print(f"  ... (showing first 10 hits)")
+                break
+        print(f"[+] Total hits: {hits_count}+")
+
+    print("\n[*] For detailed protocol analysis, use:")
+    print(f"    python3 network_analyzer.py stats {args.path}")
+    print(f"    python3 network_analyzer.py http {args.path}")
+    print(f"    python3 network_analyzer.py dns {args.path} --detect-exfil")
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Minimal CTF forensics helper (stdlib)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -198,6 +275,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("path")
     sp.add_argument("--out", required=True)
     sp.set_defaults(fn=cmd_carve_png)
+
+    sp = sub.add_parser("pcap-quick", help="quick PCAP triage (use network_analyzer.py for deep analysis)")
+    sp.add_argument("path")
+    sp.add_argument("--pattern", help="pattern to search in raw bytes")
+    sp.set_defaults(fn=cmd_pcap_quick)
 
     return p
 
